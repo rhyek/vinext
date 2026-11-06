@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { emitStandaloneOutput } from "../packages/vinext/src/build/standalone.js";
@@ -20,13 +21,13 @@ function writePackage(
   root: string,
   packageName: string,
   dependencies: Record<string, string> = {},
-  options: { exports?: Record<string, string> } = {},
+  options: { exports?: Record<string, string>; version?: string } = {},
 ): void {
   const packageRoot = path.join(root, "node_modules", packageName);
   fs.mkdirSync(packageRoot, { recursive: true });
   const pkgJson: Record<string, unknown> = {
     name: packageName,
-    version: "1.0.0",
+    version: options.version ?? "1.0.0",
     main: "index.js",
     dependencies,
   };
@@ -39,6 +40,15 @@ function writePackage(
     "utf-8",
   );
   fs.writeFileSync(path.join(packageRoot, "index.js"), "module.exports = {};\n", "utf-8");
+}
+
+/** The version Node loads for `packageName` when `dependentDir` requires it. */
+function resolvedVersion(dependentDir: string, packageName: string): string {
+  const require = createRequire(path.join(dependentDir, "package.json"));
+  const pkg = JSON.parse(
+    fs.readFileSync(require.resolve(`${packageName}/package.json`), "utf-8"),
+  ) as { version: string };
+  return pkg.version;
 }
 
 beforeEach(() => {
@@ -510,5 +520,126 @@ describe("emitStandaloneOutput", () => {
     expect(
       fs.lstatSync(path.join(appRoot, "dist/standalone/node_modules/dep-link")).isSymbolicLink(),
     ).toBe(false);
+  });
+
+  it("gives each dependent the version of a shared dependency it resolves", () => {
+    // ext-a needs shared@1 (hoisted). ext-b reaches shared@2 through ext-b-dep,
+    // which installs it in its own node_modules.
+    const appRoot = path.join(tmpDir, "app");
+    fs.mkdirSync(appRoot, { recursive: true });
+
+    writeFile(appRoot, "package.json", JSON.stringify({ name: "app" }, null, 2));
+    writeFile(appRoot, "dist/client/_next/static/main.js", "console.log('client');\n");
+    writeFile(appRoot, "dist/server/entry.js", "import 'ext-a';\nimport 'ext-b';\n");
+    writeFile(appRoot, "dist/server/vinext-externals.json", JSON.stringify(["ext-a", "ext-b"]));
+
+    writePackage(appRoot, "ext-a", { shared: "^1.0.0" });
+    writePackage(appRoot, "shared", {}, { version: "1.0.0" });
+    writePackage(appRoot, "ext-b", { "ext-b-dep": "1.0.0" });
+    writePackage(appRoot, "ext-b-dep", { shared: "^2.0.0" });
+    writePackage(path.join(appRoot, "node_modules/ext-b-dep"), "shared", {}, { version: "2.0.0" });
+
+    const fakeVinextRoot = path.join(tmpDir, "fake-vinext");
+    writeFile(
+      fakeVinextRoot,
+      "package.json",
+      JSON.stringify({ name: "vinext", type: "module" }, null, 2),
+    );
+    writeFile(
+      fakeVinextRoot,
+      "dist/server/prod-server.js",
+      "export async function startProdServer() {}\n",
+    );
+
+    emitStandaloneOutput({
+      root: appRoot,
+      outDir: path.join(appRoot, "dist"),
+      vinextPackageRoot: fakeVinextRoot,
+    });
+
+    const standaloneModules = path.join(appRoot, "dist/standalone/node_modules");
+    expect(resolvedVersion(path.join(standaloneModules, "ext-a"), "shared")).toBe("1.0.0");
+    expect(resolvedVersion(path.join(standaloneModules, "ext-b-dep"), "shared")).toBe("2.0.0");
+    expect(
+      fs.existsSync(path.join(standaloneModules, "ext-b-dep/node_modules/shared/package.json")),
+    ).toBe(true);
+  });
+
+  it("keeps a single copy of packages the server bundle imports directly", () => {
+    // ext-pin pins its own react. The server bundle imports react itself, so
+    // ext-pin must share the app root's copy rather than load a second one.
+    const appRoot = path.join(tmpDir, "app");
+    fs.mkdirSync(appRoot, { recursive: true });
+
+    writeFile(appRoot, "package.json", JSON.stringify({ name: "app" }, null, 2));
+    writeFile(appRoot, "dist/client/_next/static/main.js", "console.log('client');\n");
+    writeFile(appRoot, "dist/server/entry.js", "import 'react';\nimport 'ext-pin';\n");
+    writeFile(appRoot, "dist/server/vinext-externals.json", JSON.stringify(["react", "ext-pin"]));
+
+    writePackage(appRoot, "react", {}, { version: "19.2.7" });
+    writePackage(appRoot, "ext-pin", { react: "19.2.5" });
+    writePackage(path.join(appRoot, "node_modules/ext-pin"), "react", {}, { version: "19.2.5" });
+
+    const fakeVinextRoot = path.join(tmpDir, "fake-vinext");
+    writeFile(
+      fakeVinextRoot,
+      "package.json",
+      JSON.stringify({ name: "vinext", type: "module" }, null, 2),
+    );
+    writeFile(
+      fakeVinextRoot,
+      "dist/server/prod-server.js",
+      "export async function startProdServer() {}\n",
+    );
+
+    emitStandaloneOutput({
+      root: appRoot,
+      outDir: path.join(appRoot, "dist"),
+      vinextPackageRoot: fakeVinextRoot,
+    });
+
+    const standaloneModules = path.join(appRoot, "dist/standalone/node_modules");
+    expect(resolvedVersion(path.join(standaloneModules, "ext-pin"), "react")).toBe("19.2.7");
+    expect(fs.existsSync(path.join(standaloneModules, "ext-pin/node_modules/react"))).toBe(false);
+  });
+
+  it("gives vinext its own version of a runtime dependency the app's externals also need", () => {
+    const appRoot = path.join(tmpDir, "app");
+    fs.mkdirSync(appRoot, { recursive: true });
+
+    writeFile(appRoot, "package.json", JSON.stringify({ name: "app" }, null, 2));
+    writeFile(appRoot, "dist/client/_next/static/main.js", "console.log('client');\n");
+    writeFile(appRoot, "dist/server/entry.js", "import 'ext-a';\n");
+    writeFile(appRoot, "dist/server/vinext-externals.json", JSON.stringify(["ext-a"]));
+
+    writePackage(appRoot, "ext-a", { shared: "^1.0.0" });
+    writePackage(appRoot, "shared", {}, { version: "1.0.0" });
+
+    const fakeVinextRoot = path.join(tmpDir, "fake-vinext");
+    writeFile(
+      fakeVinextRoot,
+      "package.json",
+      JSON.stringify(
+        { name: "vinext", type: "module", dependencies: { shared: "^2.0.0" } },
+        null,
+        2,
+      ),
+    );
+    writeFile(
+      fakeVinextRoot,
+      "dist/server/prod-server.js",
+      "export async function startProdServer() {}\n",
+    );
+    writePackage(fakeVinextRoot, "shared", {}, { version: "2.0.0" });
+
+    emitStandaloneOutput({
+      root: appRoot,
+      outDir: path.join(appRoot, "dist"),
+      vinextPackageRoot: fakeVinextRoot,
+    });
+
+    const standaloneModules = path.join(appRoot, "dist/standalone/node_modules");
+    expect(resolvedVersion(path.join(standaloneModules, "ext-a"), "shared")).toBe("1.0.0");
+    expect(resolvedVersion(path.join(standaloneModules, "vinext"), "shared")).toBe("2.0.0");
   });
 });

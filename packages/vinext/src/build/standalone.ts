@@ -33,6 +33,20 @@ type QueueEntry = {
   packageName: string;
   resolver: NodeRequire;
   optional: boolean;
+  /** Standalone directory of the package that depends on this one. */
+  dependentDir: string;
+};
+
+type CopyState = {
+  copied: Set<string>;
+  /** Each standalone directory written, mapped to the real package directory it was copied from. */
+  placements: Map<string, string>;
+  /**
+   * Packages the server bundle imports directly. They keep the single top-level
+   * copy the app root resolves and a dependent never gets its own version, since
+   * a second copy would split shared state such as React's.
+   */
+  serverImports: ReadonlySet<string>;
 };
 
 function readPackageJson(packageJsonPath: string): PackageJson {
@@ -118,30 +132,55 @@ function resolvePackageJsonPath(packageName: string, resolver: NodeRequire): str
   }
 }
 
+/** The node_modules directories Node searches from `fromDir`, innermost first, up to `rootDir`. */
+function nodeModulesLookupDirs(fromDir: string, rootDir: string): string[] {
+  const dirs: string[] = [];
+  for (let dir = fromDir; ; dir = path.dirname(dir)) {
+    if (path.basename(dir) !== "node_modules") {
+      dirs.push(path.join(dir, "node_modules"));
+    }
+    if (dir === rootDir || dir === path.dirname(dir)) {
+      return dirs;
+    }
+  }
+}
+
+/**
+ * Copies each package and its runtime dependencies into `targetNodeModulesDir`
+ * so that every copied package loads the version of each dependency it resolves
+ * in the workspace.
+ *
+ * A package goes to the top level of node_modules when that slot is free. When
+ * the slot already holds a different version, the package goes into the
+ * node_modules of the dependent that needs it, where Node finds it before the
+ * top-level copy. Every call that writes into the same node_modules must share
+ * `state`.
+ */
 function copyPackageAndRuntimeDeps(
   root: string,
   targetNodeModulesDir: string,
   initialPackages: string[],
-  alreadyCopied?: Set<string>,
-): string[] {
-  // Returns the full set of package names in `copied` after the BFS completes —
-  // including any entries that were already in `alreadyCopied` before this call.
-  // Callers that need to track incremental additions should diff against their
-  // own snapshot, or use the shared `alreadyCopied` set directly.
+  state: CopyState,
+  initialDependentDir: string = path.dirname(targetNodeModulesDir),
+): void {
   const rootResolver = createRequire(path.join(root, "package.json"));
   const rootPkg = readPackageJson(path.join(root, "package.json"));
   const rootOptional = new Set(Object.keys(rootPkg.optionalDependencies ?? {}));
-  const copied = alreadyCopied ?? new Set<string>();
+  const { copied, placements, serverImports } = state;
+  const standaloneDir = path.dirname(targetNodeModulesDir);
   const queue: QueueEntry[] = initialPackages.map((packageName) => ({
     packageName,
     resolver: rootResolver,
     optional: rootOptional.has(packageName),
+    dependentDir: initialDependentDir,
   }));
 
   while (queue.length > 0) {
     const entry = queue.shift();
     if (!entry) continue;
-    if (copied.has(entry.packageName)) continue;
+
+    const topLevelTarget = path.join(targetNodeModulesDir, entry.packageName);
+    if (serverImports.has(entry.packageName) && placements.has(topLevelTarget)) continue;
 
     const packageJsonPath = resolvePackageJsonPath(entry.packageName, entry.resolver);
     if (!packageJsonPath) {
@@ -155,7 +194,18 @@ function copyPackageAndRuntimeDeps(
 
     const realPackageJsonPath = fs.realpathSync(packageJsonPath);
     const packageRoot = path.dirname(realPackageJsonPath);
-    const packageTarget = path.join(targetNodeModulesDir, entry.packageName);
+
+    // Skip when the copy Node would load from the dependent is already this one.
+    const loaded = nodeModulesLookupDirs(entry.dependentDir, standaloneDir)
+      .map((dir) => path.join(dir, entry.packageName))
+      .find((dir) => placements.has(dir));
+    if (loaded !== undefined && placements.get(loaded) === packageRoot) continue;
+
+    const packageTarget = placements.has(topLevelTarget)
+      ? path.join(entry.dependentDir, "node_modules", entry.packageName)
+      : topLevelTarget;
+    if (placements.has(packageTarget)) continue;
+
     fs.mkdirSync(path.dirname(packageTarget), { recursive: true });
     fs.cpSync(packageRoot, packageTarget, {
       recursive: true,
@@ -171,23 +221,21 @@ function copyPackageAndRuntimeDeps(
       },
     });
 
+    placements.set(packageTarget, packageRoot);
     copied.add(entry.packageName);
 
     const packageResolver = createRequire(realPackageJsonPath);
     const pkg = readPackageJson(realPackageJsonPath);
     const optionalDeps = new Set(Object.keys(pkg.optionalDependencies ?? {}));
     for (const depName of runtimeDeps(pkg)) {
-      if (!copied.has(depName)) {
-        queue.push({
-          packageName: depName,
-          resolver: packageResolver,
-          optional: optionalDeps.has(depName),
-        });
-      }
+      queue.push({
+        packageName: depName,
+        resolver: packageResolver,
+        optional: optionalDeps.has(depName),
+        dependentDir: packageTarget,
+      });
     }
   }
-
-  return [...copied];
 }
 
 function writeStandaloneServerEntry(filePath: string): void {
@@ -311,8 +359,12 @@ export function emitStandaloneOutput(options: StandaloneBuildOptions): Standalon
   const initialPackages = readServerExternalsManifest(serverDir).filter(
     (name) => name !== "vinext",
   );
-  const copiedSet = new Set<string>();
-  copyPackageAndRuntimeDeps(root, standaloneNodeModulesDir, initialPackages, copiedSet);
+  const copyState: CopyState = {
+    copied: new Set<string>(),
+    placements: new Map<string, string>(),
+    serverImports: new Set(initialPackages),
+  };
+  copyPackageAndRuntimeDeps(root, standaloneNodeModulesDir, initialPackages, copyState);
 
   // Always embed the exact vinext runtime that produced this build.
   const vinextPackageRoot = resolveVinextPackageRoot(options.vinextPackageRoot);
@@ -335,19 +387,20 @@ export function emitStandaloneOutput(options: StandaloneBuildOptions): Standalon
       return !rel.split(path.sep).includes("node_modules");
     },
   });
-  copiedSet.add("vinext");
+  copyState.copied.add("vinext");
+  copyState.placements.set(vinextTargetDir, fs.realpathSync(vinextPackageRoot));
 
   // Copy vinext's own runtime dependencies. The prod-server imports packages
   // like `rsc-html-stream` at runtime; they must be present in standalone
   // node_modules/ even if the user's app doesn't depend on them directly.
   // We resolve them from vinext's package root so nested requires work correctly.
   const vinextPkg = readPackageJson(path.join(vinextPackageRoot, "package.json"));
-  const vinextRuntimeDeps = runtimeDeps(vinextPkg).filter((name) => !copiedSet.has(name));
   copyPackageAndRuntimeDeps(
     vinextPackageRoot,
     standaloneNodeModulesDir,
-    vinextRuntimeDeps,
-    copiedSet,
+    runtimeDeps(vinextPkg),
+    copyState,
+    vinextTargetDir,
   );
 
   writeStandaloneServerEntry(path.join(standaloneDir, "server.js"));
@@ -355,6 +408,6 @@ export function emitStandaloneOutput(options: StandaloneBuildOptions): Standalon
 
   return {
     standaloneDir,
-    copiedPackages: [...copiedSet],
+    copiedPackages: [...copyState.copied],
   };
 }
